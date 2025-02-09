@@ -1,4 +1,4 @@
-# Semantic Tag Processor
+# Keyword Expander
 
 A tool for processing and expanding image metadata tags using semantic similarity and LLM validation. This tool helps organize image collections by identifying and grouping related tags while maintaining semantic hierarchies.
 
@@ -31,8 +31,10 @@ json-repair
 1. Install ExifTool for your platform: https://exiftool.org/
 2. Clone this repository
 3. Install Python dependencies: `pip install -r requirements.txt`
-4. Download a GGUF format embedding model (e.g., all-MiniLM-L6-v2)
-5. Build or obtain llama.cpp with embedding support
+4. Download a GGUF format embedding model (e.g., all-MiniLM-L6-v2) and language model (e.g., gemma-2-2b-it)
+5. Build or obtain llama.cpp and place llamacpp-embedding and needed binaries in the KeywordExpander folder
+6. Download Koboldcpp launch it with the language model
+   
 
 ## Usage
 
@@ -58,9 +60,17 @@ The script generates three JSON files in the target directory:
 - `02_mapped_candidates.json`: Initial tag similarity mappings
 - `03_mapped_keywords.json`: LLM-validated tag relationships
 
+## Credits
+Invaluable assistance provided by ocha221. After reaching out for solutions they kindly wrote a working implementation of the idea:
+- https://github.com/ocha221/semantic-tagging-tools
+
+I rewrote it to use local models and to integrate with LlamaImageTagger for keyword postprocessing. 
+
 ## License
 
 This project is licensed under GPLv3. See the LICENSE file for details.
+semantic-tagging-tools is licensed under MIT.
+Llama.cpp is licensed under MIT.
 
 ## Contributing
 
