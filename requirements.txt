@@ -1,0 +1,7 @@
+numpy
+faiss-cpu
+PyExifTool
+json-repair
+typing-extension
+pathlib
+koboldapi
