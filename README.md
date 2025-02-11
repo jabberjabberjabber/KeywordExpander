@@ -10,6 +10,9 @@ A tool for processing and expanding image metadata tags using semantic similarit
 - Validates tag relationships using LLM
 - Updates image metadata with expanded tag sets
 - Preserves semantic hierarchies (e.g., "metal" -> "material" but not "metal" -> "brass")
+- Expands uses the already existing keywords in your image library metadata
+
+![Screenshot](keywordexpander.gif)
 
 ## Requirements
 
