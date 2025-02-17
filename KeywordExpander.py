@@ -443,7 +443,7 @@ Only use the words provided in the candidates list. Do NOT add any new words. Yo
 Reply with a JSON object as follows: { str: [str, ...] } 
 """
         synonym_mapping = {}
-        i = 1
+        i = 0
         for tag, candidates in self.container.candidate_mappings.items():
             i += 1
             try:
