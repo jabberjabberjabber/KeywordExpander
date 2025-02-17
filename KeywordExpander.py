@@ -130,9 +130,9 @@ class ProcessingStats:
             f"  Unique Bases: {self.unique_bases}",
             "\nProcessing Results:",
             f"  Split Compounds: {self.split_compounds}",
-            f"  Color Compounds Processed: {self.color_compounds}",
+            f"  Color Compounds Split: {self.color_compounds}",
             f"  Embeddings Generated: {self.embeddings_generated}",
-            f"  Candidate Pairs Found: {self.candidate_pairs}",
+            f"  Candidates Found: {self.candidate_pairs}",
             f"  Verified Candidates: {self.verified_candidates}",
             f"  Final Total Keywords: {self.final_keywords}",
             f"  Expansion Rate: {self.calculate_expansion_rate():.1f}%"
@@ -196,7 +196,7 @@ class KeywordProcessor:
             self.stats.unique_compounds = len(self.container.compounds)
 
             # Extract singles
-            self.container.singles = self.extract_singles(self.container.keywords)
+            self.container.singles = self.extract_singles(self.container.raw_keywords)
             self.stats.single_keywords = len(self.container.singles)
             self.stats.unique_singles = len(set(self.container.singles))
             
@@ -210,10 +210,10 @@ class KeywordProcessor:
         if not self.config.skip_embeds and not self.container.has_candidates:
             print(f"Generating embeddings...")
             self.embeddings = self.generate_embeddings()
-            self.stats.embeddings_generated = len(self.embeddings)
+            #self.stats.embeddings_generated = len(self.embeddings)
             self.container.candidate_mappings = self.map_candidates()
-            self.stats.candidate_pairs = sum(len(candidates) 
-                for candidates in self.container.candidate_mappings.values())
+            #self.stats.candidate_pairs = sum(len(candidates) 
+            #    for candidates in self.container.candidate_mappings.values())
             
         if not self.config.skip_candidates and not self.container.has_expansions:
             self.container.keyword_expansions = self.validate_candidates()
@@ -252,8 +252,8 @@ class KeywordProcessor:
         for modifier in modifier_totals:
             total = modifier_totals[modifier]
             uniques = len(modifier_uniques[modifier])
-            if total > 3:
-                if (uniques / total) > 0.7: 
+            if total > 6:
+                if (uniques / total) > 0.8: 
                     to_split_modifier.add(modifier)
         return to_split_modifier
 
@@ -276,10 +276,9 @@ class KeywordProcessor:
         remaining = list(set(remaining))
         if to_split:
             splits = []
-            i=1
             for compound in to_split:
-                i+=1
-                print(f"Splitting {i} of {len(to_split)}: {compound}") 
+                self.stats.split_compounds += 1
+                print(f"Splitting {self.stats.split_compounds} of {len(to_split)}: {compound}") 
                 words = compound.split()
                 if words[1] in ['and', 'or']:
                     splits.append(words[0])
@@ -334,6 +333,8 @@ class KeywordProcessor:
         batch_size = 32
         batch_number = 0
         self.container.keywords = self.container.keywords
+        self.stats.embeddings_generated = len(self.container.keywords)
+        
         for i in range(0, len(self.container.keywords), batch_size):
             batch = self.container.keywords[i:i + batch_size]
             batch_number += batch_size
@@ -395,14 +396,15 @@ class KeywordProcessor:
             
             if candidates:
                 filtered_candidates = set()
+                
                 for candidate in candidates:
-                    
+                        
                     # Remove compounds and single letter keywords from candidates
                     if len(candidate.split()) != 2 and len(candidate) != 1:
                         filtered_candidates.add(candidate)
-                
-                candidate_mapping[tag] = list(filtered_candidates)
                     
+                candidate_mapping[tag] = list(filtered_candidates)
+                self.stats.candidate_pairs += len(filtered_candidates)    
         return candidate_mapping
         
     def validate_candidates(self) -> Dict[str, List[str]]:
@@ -457,7 +459,7 @@ Reply with a JSON object as follows: { str: [str, ...] }
                         result_list = self._remove_pretend_words(list(set(result_list)), candidates) 
                         synonym_mapping[tag] = result_list
                         print(f"Validated {i} of {len(self.container.keywords)} {tag}: {result_list}")
-                        
+                        self.stats.verified_candidates += len(result_list)
             except Exception as e:
                 print(f"Error validating {tag}: {str(e)}")
                 continue
