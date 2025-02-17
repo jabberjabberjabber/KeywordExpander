@@ -5,21 +5,22 @@ A tool for processing and expanding image metadata tags using semantic similarit
 ## Features
 
 - Extracts existing metadata tags from images
+- Splits compound terms based on uniqueness ratio
 - Generates semantic embeddings for tags using llama.cpp
 - Identifies semantically similar tags using FAISS
 - Validates tag relationships using LLM
 - Updates image metadata with expanded tag sets
 - Preserves semantic hierarchies (e.g., "metal" -> "material" but not "metal" -> "brass")
-- Expands uses the already existing keywords in your image library metadata
+- Uses only the already existing keywords in your image library metadata
 
-![Screenshot](keywordexpander.gif)
+![Screenshot](keywordexpander.jpg)
 
 ## Requirements
 
 - Python 3.8+
 - ExifTool
-- llama.cpp with embedding support
-- Kobold API compatible LLM server
+- llama.cpp embedding server
+- KoboldCpp
 
 Python dependencies:
 ```
@@ -27,6 +28,7 @@ exiftool
 numpy
 faiss-cpu
 json-repair
+koboldapi-python
 ```
 
 ## Installation
@@ -43,7 +45,7 @@ json-repair
 
 Basic usage:
 ```bash
-python postprocess.py /path/to/image/directory \
+python KeywordExpander.py /path/to/image/directory \
     --model-path /path/to/embedding-model.gguf \
     --llama-path /path/to/llama-embedding \
     --api-url http://localhost:5001
@@ -59,15 +61,12 @@ The script will:
 ## Output Files
 
 The script generates three JSON files in the target directory:
-- `01_metadata.json`: Raw metadata from images
-- `02_mapped_candidates.json`: Initial tag similarity mappings
-- `03_mapped_keywords.json`: LLM-validated tag relationships
+- `KeywordExpander_metadata.json`: Raw metadata from images
+- `KeywordExpander_expansions.json`: Expansion mappings
 
 ## Credits
 Invaluable assistance provided by ocha221. After reaching out for solutions they kindly wrote a working implementation of the idea:
 - https://github.com/ocha221/semantic-tagging-tools
-
-I rewrote it to use local models and to integrate with LlamaImageTagger for keyword postprocessing. 
 
 ## License
 
