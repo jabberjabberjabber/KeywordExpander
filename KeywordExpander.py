@@ -1,576 +1,623 @@
 import json
-import exiftool
-import numpy as np
-import faiss
-import subprocess
 import os
-import time
+import re
 import sys
+import time
+import logging
 import argparse
-from typing import List, Dict, Optional
 from pathlib import Path
-from koboldapi import KoboldAPICore
-from json_repair import repair_json as rj
-from dataclasses import dataclass
+from typing import Dict, List, Optional
 from collections import defaultdict
+from dataclasses import dataclass, field
+
+import exiftool
+import faiss
+import numpy as np
+import requests
+from json_repair import repair_json as rj
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+COLORS = {
+    'red', 'blue', 'green', 'yellow', 'purple', 'orange',
+    'white', 'black', 'gray', 'grey', 'brown', 'beige',
+    'pink', 'turquoise', 'golden', 'plaid', 'clear', 'metallic',
+}
+
+LLM_SYSTEM_PROMPT = """\
+A JSON object will be returned which matches the given key as a word to a list of words that belong in a set with that key.
+
+The KEY and CANDIDATES are provided as {word: [candidate, ...]}
+The RESPONSE will be provided as {word: [verified candidate, ...]}
+
+ONLY respond with candidates which you have VERIFIED.
+
+How to verify a candidate:
+
+- If the CANDIDATE means the same thing as the KEY, verify it
+- If the KEY belongs to a SET for which the CANDIDATE is the PARENT, verify it
+
+If no candidates match for verification, you may respond with an empty list after the key.
+
+EXAMPLES:
+
+VERIFY: KEY is "metal" and CANDIDATE is "material" since "metal" is a type of "material", making "material" the parent of a set which includes "metal".
+IGNORE: KEY is "metal" and CANDIDATE is "brass" since "brass" is not a parent of "metal". "metal" cannot belong to a set where "brass" is the parent.
+
+EXAMPLE INPUT: {"dog": ["poodle", "animal", "pet", "mammal", "canine"]}
+EXAMPLE OUTPUT: {"dog": ["animal", "mammal", "canine"]}
+
+EXAMPLE INPUT: {"serious": ["table", "crockpot", "funny", "brother"]}
+EXAMPLE OUTPUT: {"serious": []}\
+
+"""
 
 class Config:
-    """ Configuration for keyword processing """
     def __init__(self):
-        self.model_path = "all-MiniLM-L6-v2-ggml-model-f16.gguf"
-        self.llama_path = "llama-embedding.exe"
-        self.api_url = "http://localhost:5001"
-        self.directory = None
+        self.api_base_url = "http://localhost:8080" 
+        self.api_key = ""
+        self.embedding_model = ""
+        self.chat_model = ""
+        self.directory: Optional[str] = None
         self.max_candidates = 15
         self.similarity_threshold = 0.64
-        self.skip_candidates = False
         self.skip_embeds = False
-        self.skip_metadata = False
-        self.skip_compounds = False
-        self.load_json = None
-          
+        self.skip_candidates = False
+        self.load_json: Optional[str] = None
+
     @classmethod
-    def from_args(cls, args):
-        """ Create config from command line arguments """
-        config = cls()
-        config.model_path = args.model_path
-        config.llama_path = args.llama_path
-        config.api_url = args.api_url
-        config.directory = args.directory
+    def from_args(cls, args) -> "Config":
+        c = cls()
+        c.api_base_url = args.api_base_url
+        c.api_key = args.api_key
+        c.embedding_model = args.embedding_model
+        c.chat_model = args.chat_model
+        c.directory = args.directory
+        c.max_candidates = args.max_candidates
+        c.similarity_threshold = args.similarity_threshold
+        c.skip_embeds = args.skip_embeds
+        c.skip_candidates = args.skip_candidates
+        c.load_json = args.load_json
+        return c
 
-        return config
-                     
-class KeywordContainer:
-    """ Contains and tracks state of keyword processing """
-    def __init__(self, metadata: List[Dict]):
-        self.file_metadata = metadata
-        self.raw_keywords = None  # Initial keywords from metadata
-        self.keywords = None      # Current set of keywords
-        self.raw_compounds = None
-        self.compounds = None     # Identified compound keywords
-        self.singles = None       # Single word keywords
-        self.removed = {}         # Tracks removed keywords and reasons
-        self.candidate_mappings = None  # Dict[str, List[str]]
-        self.keyword_expansions = None  # Dict[str, List[str]]
-        self.compound_splits = None  # Dict[str, List[str]]
+class OpenAIClient:
+    def __init__(self, config: Config):
+        base = config.api_base_url.rstrip("/")
+        # Tolerate the user accidentally including /v1 in the base URL
+        if base.endswith("/v1"):
+            base = base[:-3]
+        self.base_url = base
+        self.embedding_model = config.embedding_model
+        self.chat_model = config.chat_model
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {config.api_key}",
+            "Content-Type": "application/json",
+        })
 
-    @property 
-    def has_keywords(self) -> bool:
-        return bool(self.keywords)
-        
-    @property
-    def has_compounds(self) -> bool:
-        return bool(self.compounds)
+    def get_embedding(self, text: str) -> Optional[List[float]]:
+        try:
+            r = self.session.post(
+                f"{self.base_url}/v1/embeddings",
+                json={"model": self.embedding_model, "input": text, "encoding_format": "float"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()["data"][0]["embedding"]
+        except Exception as e:
+            logger.error(f"Embedding failed for '{text}': {e}")
+            return None
 
-    @property
-    def has_compound_splits(self) -> bool:
-        return bool(self.compound_splits)
-    
-    @property
-    def has_candidates(self) -> bool:
-        return bool(self.candidate_mappings)
-        
-    @property
-    def has_expansions(self) -> bool:
-        return bool(self.keyword_expansions)
+    def chat(
+        self,
+        messages: List[Dict],
+        max_tokens: int = 200,
+        temperature: float = 0.1,
+        top_p: float = 0.95,
+        top_k: int = 120,
+        min_p: float = 0.0,
+        rep_pen: float = 1.05,
+    ) -> Optional[str]:
+        try:
+            r = self.session.post(
+                f"{self.base_url}/v1/chat/completions",
+                json={
+                    "model": self.chat_model,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "top_k": top_k,
+                    "min_p": min_p,
+                    "repetition_penalty": rep_pen,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+                timeout=60,
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            logger.error(f"Chat request failed: {e}")
+            return None
 
-    def prepare_output(self) -> List[Dict]:
-        """ Creates new metadata entries with expanded keywords """
-        result = []
-        for entry in self.file_metadata:
-            if 'Composite:Keywords' not in entry:
-                continue
-                
-            new_entry = entry.copy()
-            current_set = set(entry['Composite:Keywords'])
-            for keyword in self.keyword_expansions:
-                if keyword in current_set:
-                    current_set.update(self.keyword_expansions[keyword])
-            new_entry['Composite:Keywords'] = list(current_set)
-            result.append(new_entry)
-        return result
 @dataclass
 class ProcessingStats:
-    """ Tracks statistics for keyword processing pipeline """
     initial_keywords: int = 0
     unique_keywords: int = 0
-    single_keywords: int = 0
-    unique_singles: int = 0
-    compound_keywords: int = 0
-    unique_compounds: int = 0
-    unique_modifiers: int = 0
-    unique_bases: int = 0
-    split_compounds: int = 0
-    color_compounds: int = 0
+    color_compounds_removed: int = 0
+    compounds_split: int = 0
+    final_keyword_count: int = 0
     embeddings_generated: int = 0
     candidate_pairs: int = 0
-    verified_candidates: int = 0
-    final_keywords: int = 0
-    processing_times: dict = None
-    
-    def calculate_expansion_rate(self) -> float:
-        """ Calculate the percentage increase in keywords """
-        if self.initial_keywords == 0:
-            return 0
-        return ((self.final_keywords - self.initial_keywords) / 
-                self.initial_keywords * 100)
-    
+    verified_expansions: int = 0
+    processing_times: dict = field(default_factory=dict)
+
     def __str__(self) -> str:
-        """ Format stats for display """
         lines = [
-            "Processing Statistics:",
-            "\nInitial State:",
-            f"  Total Keywords: {self.initial_keywords}",
-            f"  Unique Keywords: {self.unique_keywords}",
-            f"  Single Keywords: {self.single_keywords}",
-            f"  Unique Singles: {self.unique_singles}",
-            f"  Compound Keywords: {self.compound_keywords}",
-            f"  Unique Compounds: {self.unique_compounds}",
-            f"  Unique Modifiers: {self.unique_modifiers}",
-            f"  Unique Bases: {self.unique_bases}",
-            "\nProcessing Results:",
-            f"  Split Compounds: {self.split_compounds}",
-            f"  Color Compounds Split: {self.color_compounds}",
-            f"  Embeddings Generated: {self.embeddings_generated}",
-            f"  Candidates Found: {self.candidate_pairs}",
-            f"  Verified Candidates: {self.verified_candidates}",
-            f"  Final Total Keywords: {self.final_keywords}",
-            f"  Expansion Rate: {self.calculate_expansion_rate():.1f}%"
+            "\nProcessing Statistics:",
+            f"  Initial keywords:        {self.initial_keywords}",
+            f"  Unique keywords:         {self.unique_keywords}",
+            f"  Color compounds removed: {self.color_compounds_removed}",
+            f"  Compounds split:         {self.compounds_split}",
+            f"  Final keyword set:       {self.final_keyword_count}",
+            f"  Embeddings generated:    {self.embeddings_generated}",
+            f"  Candidate pairs:         {self.candidate_pairs}",
+            f"  Verified expansions:     {self.verified_expansions}",
         ]
-        
         if self.processing_times:
-            lines.extend([
-                "\nProcessing Times:",
-                f"  Initial Processing: {self.processing_times.get('initial_processing', 0):.2f}s",
-                f"  Compound Analysis: {self.processing_times.get('compound_analysis', 0):.2f}s",
-                f"  Total Time: {sum(self.processing_times.values()):.2f}s"
-            ])
-            
+            lines.append("\nTiming:")
+            for step, t in self.processing_times.items():
+                lines.append(f"  {step:<26} {t:.1f}s")
+            lines.append(f"  {'total':<26} {sum(self.processing_times.values()):.1f}s")
         return "\n".join(lines)
 
 class KeywordProcessor:
-    """ Handles keyword processing pipeline """
-    def __init__(self, container: KeywordContainer, config: Config):
-        self.container = container
+    """Three-step pipeline with checkpoints"""
+
+    def __init__(self, config: Config):
         self.config = config
-        self.embeddings = None
-        generation_params = {
-            "max_context": 4096,
-            "max_length": 100,
-            "top_p": 0.95,
-            "top_k": 40,
-            "temp": 0.4,
-            "rep_pen": 1.01,
-            "min_p": 0.05,
-        }
-        self.core = KoboldAPICore(config.api_url, generation_params)
-        
-        # Color descriptions are annoying because it makes multiples of everything
-        # that can have a color: "blue cup", "red cup", "white cup"
-        self.colors = {
-            'red', 'blue', 'green', 'yellow', 'purple', 'orange',
-            'white', 'black', 'gray', 'grey', 'brown', 'beige',
-            'pink', 'turquoise', 'golden', 'plaid', 'clear', 'metallic'
-        }    
-    
-    def process(self):
+        self.client = OpenAIClient(config)
         self.stats = ProcessingStats()
-        self.process_times = {}
-        
-        if not self.container.has_keywords:
-            start = time.time()
-            
-            # Extract initial keywords
-            self.container.raw_keywords = self.extract_keywords(self.container.file_metadata)
-            self.stats.initial_keywords = len(self.container.raw_keywords)
-            
-            # Process color terms
-            self.container.raw_keywords = self._remove_color_prefixes(self.container.raw_keywords)
-            self.container.keywords = list(set(self.container.raw_keywords))
-            self.stats.unique_keywords = len(self.container.keywords)
-            
-            # Extract compounds
-            self.container.raw_compounds = self.extract_compounds(self.container.raw_keywords)
-            self.stats.compound_keywords = len(self.container.raw_compounds)
-            self.container.compounds = self.extract_compounds(self.container.keywords)
-            self.stats.unique_compounds = len(self.container.compounds)
+        self._times: Dict[str, float] = {}
+        self.keywords: List[str] = []
+        self.candidate_mappings: Dict[str, List[str]] = {}
+        self.expansions: Dict[str, List[str]] = {}
 
-            # Extract singles
-            self.container.singles = self.extract_singles(self.container.raw_keywords)
-            self.stats.single_keywords = len(self.container.singles)
-            self.stats.unique_singles = len(set(self.container.singles))
-            
-            self.process_times['initial_processing'] = time.time() - start
-            
-            start = time.time()
-            self._analyze_compound_structure()
-            self.process_splits(self.container.raw_compounds)
-            self.process_times['compound_analysis'] = time.time() - start
-            
-        if not self.config.skip_embeds and not self.container.has_candidates:
-            print(f"Generating embeddings...")
-            self.embeddings = self.generate_embeddings()
-            #self.stats.embeddings_generated = len(self.embeddings)
-            self.container.candidate_mappings = self.map_candidates()
-            #self.stats.candidate_pairs = sum(len(candidates) 
-            #    for candidates in self.container.candidate_mappings.values())
-            
-        if not self.config.skip_candidates and not self.container.has_expansions:
-            self.container.keyword_expansions = self.validate_candidates()
-            self.stats.verified_candidates = sum(len(expansions) 
-                for expansions in self.container.keyword_expansions.values())
-            self.stats.final_keywords = (len(self.container.keywords) + 
-                self.stats.verified_candidates)
-        
-        self.stats.processing_times = self.process_times
-            
-    def pre_splits(self, compounds: List[str]):
-        """ Analyze compounds for statistical patterns suggesting splits 
-            
-            Compound word = modifier + base
-            Compounds with same starting modifier that are unique, divided
-            by total compounds with the starting modifier approaches 1
-            makes chance of modifier being a descriptor higher. If 
-            modifier is a descriptor, we can split the compound.
-        """
-        
-        modifier_totals = defaultdict(int)
-        modifier_uniques = defaultdict(set)
-        
-        for compound in compounds:
-            words = compound.split()
-            if len(words) != 2:  # Skip compounds that aren't exactly two words
+    def prepare(self, metadata: List[Dict]):
+        """Extract keywords from metadata, clean, and split compounds"""
+        t = time.time()
+        raw = self._extract_raw_keywords(metadata)
+        self.stats.initial_keywords = len(raw)
+
+        cleaned = self._strip_color_prefixes(raw)
+
+        unique = list(dict.fromkeys(cleaned))
+        self.stats.unique_keywords = len(unique)
+
+        self.keywords = self._split_compounds(unique)
+        self.stats.final_keyword_count = len(self.keywords)
+
+        self._times["preparation"] = time.time() - t
+        self.stats.processing_times = dict(self._times)
+
+    def embed(self, embeddings_file: Optional[Path] = None):
+        """Generate embeddings and build FAISS candidate map"""
+        t = time.time()
+        self.candidate_mappings = self._build_candidate_map(embeddings_file)
+        self._times["embedding"] = time.time() - t
+        self.stats.processing_times = dict(self._times)
+
+    def validate(self) -> Dict[str, List[str]]:
+        """Validate candidates with LLM"""
+        t = time.time()
+        self.expansions = self._validate_candidates()
+        self._times["llm_validation"] = time.time() - t
+        self.stats.processing_times = dict(self._times)
+        return self.expansions
+
+    def _extract_raw_keywords(self, metadata: List[Dict]) -> List[str]:
+        raw: List[str] = []
+        for entry in metadata:
+            kw = entry.get("Composite:Keywords") or entry.get("Subject")
+            if not kw:
                 continue
-            modifier, base = words
-            
-            # Track counts and partnerships
-            modifier_totals[modifier] += 1
-            modifier_uniques[modifier].add(compound)
+            if isinstance(kw, str):
+                raw.append(kw)
+            elif isinstance(kw, list):
+                raw.extend(str(k) for k in kw)
+        return raw
 
-        to_split_modifier = set()
-
-        for modifier in modifier_totals:
-            total = modifier_totals[modifier]
-            uniques = len(modifier_uniques[modifier])
-            if total > 6:
-                if (uniques / total) > 0.8: 
-                    to_split_modifier.add(modifier)
-        return to_split_modifier
-
-    def extract_singles(self, keywords: List[str]) -> List[str]:
-        """ Extract single-word keywords """
-        return [k for k in keywords if len(k.split()) == 1]
-
-    def process_splits(self, compounds: List[str]):
-        """ Process all compound splitting methods """
-        
-        to_split_modifier = self.pre_splits(compounds)
-        to_split = [] 
-        
-        for compound in compounds:
-            if compound.split()[0] in to_split_modifier:
-                to_split.append(compound)
-                
-        remaining = [c for c in compounds if c not in to_split]
-        to_split = list(set(to_split))
-        remaining = list(set(remaining))
-        if to_split:
-            splits = []
-            for compound in to_split:
-                self.stats.split_compounds += 1
-                print(f"Splitting {self.stats.split_compounds} of {len(to_split)}: {compound}") 
-                words = compound.split()
-                if words[1] in ['and', 'or']:
-                    splits.append(words[0])
-                    splits.append(words[2])
-                else:
-                    splits.extend(words)
-            # Remove split compounds
-            self.container.keywords = [k for k in self.container.keywords 
-                                     if k not in to_split]
-            self.container.keywords.extend(splits)
-            self.container.keywords = list(set(self.container.keywords))
-
-    def _analyze_compound_structure(self):
-        """ Analyze structure of compound keywords """
-        modifiers = set()
-        bases = set()
-        
-        for compound in self.container.compounds:
-            words = compound.split()
-            if len(words) == 2:
-                modifiers.add(words[0])
-                bases.add(words[1])
-                
-        self.stats.unique_modifiers = len(modifiers)
-        self.stats.unique_bases = len(bases)
-        
-    def extract_keywords(self, entries) -> List[str]:
-        """ Extract keywords from metadata """
-        keywords = []        
-        for entry in entries:
-            if 'Composite:Keywords' in entry:
-                keywords.extend(entry['Composite:Keywords'])
-            elif 'Subject' in entry:
-                keywords.extend(entry['Subject'])
-            else:
-                if isinstance(entry, list):
-                    keywords.extend(entry)
-        return keywords
-    
-    def extract_compounds(self, keyword_list) -> List[str]:
-        """ Find multi-word keywords that are 2-3 words long. """
-        compounds = []
-        for entry in keyword_list:
-            words = str(entry).split()
-            if 1 < len(words) < 4:  # Keep compounds of 2-3 words
-                compounds.append(entry)
-        return compounds 
-        
-    def generate_embeddings(self) -> np.ndarray:
-        """ Generate embeddings using llama.cpp """
-        embeddings_dict = {'data': []}
-        batch_size = 32
-        batch_number = 0
-        self.container.keywords = self.container.keywords
-        self.stats.embeddings_generated = len(self.container.keywords)
-        
-        for i in range(0, len(self.container.keywords), batch_size):
-            batch = self.container.keywords[i:i + batch_size]
-            batch_number += batch_size
-            
-            #print(f"Embedded {batch_number} of {len(self.container.keywords)}: {', '.join(batch)}")
-            cmd = [
-                str(self.config.llama_path),
-                "-m", str(self.config.model_path),
-                "--embd-normalize", "2",
-                "--embd-output-format", "json",
-                #"--pooling", "mean",
-                "-c", "512",
-                "-p", '\n'.join(batch)
-            ]
-            try:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                batch_embeddings = json.loads(result.stdout)
-                embeddings_dict['data'].extend(batch_embeddings['data'])
-                        
-            except subprocess.CalledProcessError as e:
-                print(f"Process error: {e}")
-                print(f"Error output: {e.stderr}")
-                continue
-            except json.JSONDecodeError as e:
-                print(f"JSON parsing error: {e}")
-                continue
-                    
-        if not embeddings_dict['data']:
-            raise RuntimeError("Failed to generate any valid embeddings")
-
-        embeddings_list = [item['embedding'] for item in embeddings_dict['data']]
-        embeddings = np.array(embeddings_list, dtype='float32')
-        faiss.normalize_L2(embeddings)
-        
-        return embeddings
-      
-    def map_candidates(self) -> Dict[str, List[str]]:
-        """ Find candidate matches using FAISS """
-        index = faiss.IndexFlatL2(self.embeddings.shape[1])
-        index.add(self.embeddings)
-        candidate_mapping = {}
-        for idx, tag in enumerate(self.container.keywords):
-            query_embedding = self.embeddings[idx].reshape(1, -1)
-            distances, indices = index.search(
-                query_embedding, 
-                self.config.max_candidates + 1
-            )        
-            candidates = [
-                self.container.keywords[i] 
-                for i, dist in zip(indices[0], distances[0])
-                if self.container.keywords[i] != tag 
-                and dist < self.config.similarity_threshold
-            ][:self.config.max_candidates]
-            
-            if candidates:
-                filtered_candidates = set()
-                
-                for candidate in candidates:
-                        
-                    # Remove compounds and single letter keywords from candidates
-                    if len(candidate.split()) != 2 and len(candidate) != 1:
-                        filtered_candidates.add(candidate)
-                    
-                candidate_mapping[tag] = list(filtered_candidates)
-                self.stats.candidate_pairs += len(filtered_candidates)    
-        return candidate_mapping
-        
-    def validate_candidates(self) -> Dict[str, List[str]]:
-        """ Validate candidates using LLM """
-        
-        prompt = """Your task is to identify exact synonyms for the input word and parents of the input word. 
-IMPORTANT: The synonyms will always be ABOVE the input word in the parent hierarchy and thus a MORE GENERAL describer.
-
-Find EXACT SYNONYMS in the list. Only use words included in the list; do not add any addition words.
-Include ONLY if:
-   - Words mean EXACTLY the same thing (like "car" = "automobile")
-   - Can substitute in ANY context with NO change in meaning
-   - Word is in the list
-   
-Find GENERAL TERMS or CATEGORIES that fit ABOVE the input word in the hierarchy list.
-Include ONLY if:
-   - Parent is MORE GENERAL than input word
-   - Word is in the list
-   
-CRITICAL RELATIONSHIP DIRECTION:
-VALID "metal" -> "material" (VALID: metal is a type of material)
-INVALID "metal" -> "brass" (INVALID: brass is a type of metal - wrong direction!)
-INVALID "metal" -> "bronze" (INVALID: bronze is a type of metal - wrong direction!)
-
-EXAMPLE OUTPUTS:
-Input: "metal"
-Candidates: "brass, bronze, gold, material, substance"
-Valid output: {"metal": ["material", "substance"]}  # only parent categories, NO subtypes
-
-Input: "dog"
-Candidates: "poodle, animal, pet, mammal, canine"
-Valid output: {"dog": ["animal", "mammal", "canine"]}  # only parent categories and synonyms
-
-Only use the words provided in the candidates list. Do NOT add any new words. You do not have to use all or any of the words in the list and can return an empty list.
-
-Reply with a JSON object as follows: { str: [str, ...] } 
-"""
-        synonym_mapping = {}
-        i = 0
-        for tag, candidates in self.container.candidate_mappings.items():
-            i += 1
-            try:
-                result = json.loads(rj(self.core.wrap_and_generate(
-                    instruction=prompt,
-                    content=f'\nWord: "{tag}"\nCandidates: {", ".join(candidates)}\n'))
-                )
-                if isinstance(result, dict):
-                    result_list = result.get(tag, [])
-                    
-                    if result_list:
-                        #check if the LLM made up candidates
-                        result_list = self._remove_pretend_words(list(set(result_list)), candidates) 
-                        synonym_mapping[tag] = result_list
-                        print(f"Validated {i} of {len(self.container.keywords)} {tag}: {result_list}")
-                        self.stats.verified_candidates += len(result_list)
-            except Exception as e:
-                print(f"Error validating {tag}: {str(e)}")
-                continue
-            
-        return synonym_mapping
-
-    def _remove_pretend_words(self, result_list, candidates):
-        """ Check if the LLM made up any candidates and remove them """
-        return [word for word in result_list if word in candidates]
-        
-    def _remove_color_prefixes(self, strings: List[str]) -> List[str]:
-        """ Remove color descriptors from strings """
+    def _strip_color_prefixes(self, keywords: List[str]) -> List[str]:
+        """Replace 'red car' with 'car'"""
         result = []
-        self.stats.color_compounds = 0
-        
-        for s in strings:
-            words = str(s).split()
-            if (len(words) == 2) and (words[0] in self.colors):
+        for kw in keywords:
+            words = kw.split()
+            if len(words) == 2 and words[0].lower() in COLORS:
                 result.append(words[1])
-                self.stats.color_compounds += 1
+                self.stats.color_compounds_removed += 1
             else:
-                result.append(s)
-                
+                result.append(kw)
         return result
-        
-def extract_entries_from_json(json_file: str):
-    """ Loads and returns entries from a JSON file """
-    with open(json_file, 'r', encoding='utf-8') as f:
-        entries = json.load(f)
-    return entries
-    
-def save_json(data, path):
-    """ Helper to save JSON files """
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2)
-        print(f"Saved to {path}")
-        
-def main():
-    parser = argparse.ArgumentParser(description='Semantic tag merger')
-    parser.add_argument('--model-path', type=str,
-                       default="all-MiniLM-L6-v2-ggml-model-f16.gguf",
-                       help='Path to embedding model')
-    parser.add_argument('--llama-path', type=str,
-                       default="llama-embedding.exe",
-                       help='Path to llama-embeddings')
-    parser.add_argument('directory', type=str,
-                       help="Directory containing the files")
-    parser.add_argument("--api-url", default="http://localhost:5001",
-                       help="URL for the LLM API")
-    args = parser.parse_args()
-    
-    config = Config.from_args(args)
-    
-    if not os.path.exists(config.directory):
-        print(f"Directory not found: {config.directory}")
-        sys.exit(1)
-    
-    print(f"Extracting metadata from {config.directory}")
-    if os.path.exists(os.path.join(config.directory, 'KeywordExpander_metadata.json')):
-        metadata = extract_entries_from_json(os.path.join(config.directory, 'KeywordExpander_metadata.json'))
-        
-    else:
-        with exiftool.ExifToolHelper() as et:
-            metadata = et.get_tags(config.directory, ["MWG:Keywords"], "-r")
-        
-        if metadata:
-            path = os.path.join(config.directory, "KeywordExpander_metadata.json")
-            save_json(metadata, path)
-    
-    container = KeywordContainer(metadata)
-    processor = KeywordProcessor(container, config)
-    
-    # Run processing pipeline
-    processor.process()
-    print(processor.stats)
-    
-    if container.has_expansions:
-        save_json(container.keyword_expansions, "KeywordExpander_expansions.json")
-    
-    # Write expanded keywords back to files
-    if container.has_expansions:
-        expanded_entries = container.prepare_output()
-        print(f"Expanding metadata...")
-        with exiftool.ExifToolHelper() as et:
-            for entry in expanded_entries:
-                if 'SourceFile' not in entry or 'Composite:Keywords' not in entry:
-                    continue
-                    
-                file_path = Path(config.directory) / entry['SourceFile']
-                if not file_path.exists():
-                    print(f"File not found: {file_path}")
-                    continue
-                    
-                if not os.access(file_path, os.W_OK):
-                    print(f"No write permission for file: {file_path}")
-                    continue
-                    
-                metadata = {'MWG:Keywords': entry['Composite:Keywords']}
-                
+
+    def _find_splittable_modifiers(self, compounds: List[str]) -> set:
+        """Return modifiers that appear in enough unique compounds to be descriptors.
+
+        A modifier is splittable when it modifies many different bases,
+        suggesting it is a standalone descriptor rather than part of a fixed phrase.
+        Threshold: >3 occurrences, >70% unique compound ratio.
+        """
+        totals: Dict[str, int] = defaultdict(int)
+        uniques: Dict[str, set] = defaultdict(set)
+        for c in compounds:
+            mod = c.split()[0]
+            totals[mod] += 1
+            uniques[mod].add(c)
+        return {
+            mod for mod, total in totals.items()
+            if total > 3 and len(uniques[mod]) / total > 0.7
+        }
+
+    def _split_compounds(self, keywords: List[str]) -> List[str]:
+        """Split compound keywords"""
+        compounds = [kw for kw in keywords if 1 < len(kw.split()) < 4]
+        splittable = self._find_splittable_modifiers(compounds)
+        if not splittable:
+            return keywords
+
+        to_split = {c for c in compounds if c.split()[0] in splittable}
+        survivors = [kw for kw in keywords if kw not in to_split]
+
+        parts: List[str] = []
+        for compound in to_split:
+            self.stats.compounds_split += 1
+            words = compound.split()
+            if len(words) == 3 and words[1] in ("and", "or"):
+                parts.extend([words[0], words[2]])
+            elif len(words) == 2:
+                parts.extend(words)
+
+        return list(dict.fromkeys(survivors + parts))
+
+    def _generate_embeddings(self) -> Optional[np.ndarray]:
+        vectors = []
+        n = len(self.keywords)
+        for i, kw in enumerate(self.keywords):
+            if i % 50 == 0:
+                print(f"  Embedding {i}/{n}...")
+            vec = self.client.get_embedding(kw)
+            if vec is None:
+                logger.warning(f"No embedding for '{kw}', substituting zeros")
+                vec = [0.0] * 384
+            vectors.append(vec)
+
+        if not vectors:
+            logger.error("No embeddings generated")
+            return None
+
+        arr = np.array(vectors, dtype="float32")
+        faiss.normalize_L2(arr)
+        return arr
+
+    def _save_embeddings(self, arr: np.ndarray, path: Path):
+        np.savez(str(path), embeddings=arr, keywords=np.array(self.keywords, dtype=object))
+        logger.info(f"Saved embeddings checkpoint: {path}")
+
+    def _load_embeddings(self, path: Path) -> Optional[np.ndarray]:
+        try:
+            data = np.load(str(path), allow_pickle=True)
+            if data["keywords"].tolist() != self.keywords:
+                logger.info("Embeddings checkpoint keyword list has changed — regenerating")
+                return None
+            logger.info(f"Loaded embeddings from {path}")
+            return data["embeddings"].astype("float32")
+        except Exception as e:
+            logger.warning(f"Could not load embeddings checkpoint: {e}")
+            return None
+
+    def _build_candidate_map(self, embeddings_file: Optional[Path] = None) -> Dict[str, List[str]]:
+        if not self.keywords:
+            return {}
+
+        embeddings = None
+        if embeddings_file and embeddings_file.exists():
+            embeddings = self._load_embeddings(embeddings_file)
+
+        if embeddings is None:
+            print(f"Generating embeddings for {len(self.keywords)} keywords...")
+            embeddings = self._generate_embeddings()
+            if embeddings is None:
+                return {}
+            if embeddings_file:
+                self._save_embeddings(embeddings, embeddings_file)
+                print(f"Embeddings checkpoint saved to {embeddings_file}")
+
+        self.stats.embeddings_generated = len(self.keywords)
+
+        index = faiss.IndexFlatL2(embeddings.shape[1])
+        index.add(embeddings)
+
+        candidates: Dict[str, List[str]] = {}
+        for idx, tag in enumerate(self.keywords):
+            if len(tag.split()) > 3:
+                continue
+            q = embeddings[idx].reshape(1, -1)
+            dists, idxs = index.search(q, self.config.max_candidates + 1)
+            matches = [
+                self.keywords[i]
+                for i, d in zip(idxs[0], dists[0])
+                if self.keywords[i] != tag
+                and d < self.config.similarity_threshold
+                and len(self.keywords[i]) > 1
+            ][: self.config.max_candidates]
+            if matches:
+                candidates[tag] = matches
+
+        self.stats.candidate_pairs = sum(len(v) for v in candidates.values())
+        return candidates
+
+    @staticmethod
+    def _parse_llm_response(raw: str) -> Optional[List[str]]:
+        """Extract the candidate list from an LLM response.
+
+        Returns [] for a valid but empty response, None when unparseable
+        """
+        def strings_from(data) -> Optional[List[str]]:
+            """Return a flat list of strings from any parsed JSON structure
+            """
+            if isinstance(data, list):
+                return [item for item in data if isinstance(item, str)]
+            if isinstance(data, dict):
+                for v in data.values():
+                    if isinstance(v, list):
+                        return [item for item in v if isinstance(item, str)]
+                return []
+            return None
+
+        def try_parse(text: str) -> Optional[List[str]]:
+            for loader in (json.loads, lambda t: json.loads(rj(t))):
                 try:
-                    et.set_tags(
-                        str(file_path),
-                        tags=metadata,
-                        params=["-P", "-overwrite_original"],
-                    )
-                    #print(f"{file_path}: Success!")
-                except Exception as e:
-                    print(f"Error updating metadata for {file_path}: {str(e)}")
-    
-    print("Processing complete!")
-    
-if __name__ == '__main__':
+                    result = strings_from(loader(text))
+                    if result is not None:
+                        return result
+                except Exception:
+                    pass
+            return None
+
+        if not raw:
+            return None
+
+        # strips <think> preamble and leading text
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end > start:
+            result = try_parse(raw[start : end + 1])
+            if result is not None:
+                return result
+
+        # markdown fenced block ```json ... ```
+        m = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL)
+        if m:
+            result = try_parse(m.group(1))
+            if result is not None:
+                return result
+
+        # array found anywhere in the text
+        m = re.search(r"\[([^\[\]]*)\]", raw, re.DOTALL)
+        if m:
+            result = try_parse("[" + m.group(1) + "]")
+            if result is not None:
+                return result
+
+        # repair the whole string
+        return try_parse(raw)
+
+    def _validate_candidates(self) -> Dict[str, List[str]]:
+        if not self.candidate_mappings:
+            return {}
+        total = len(self.candidate_mappings)
+        print(f"Validating {total} keywords with LLM...")
+        expansions: Dict[str, List[str]] = {}
+        candidate_set_cache: Dict[str, set] = {
+            tag: set(cands) for tag, cands in self.candidate_mappings.items()
+        }
+
+        for i, (tag, candidates) in enumerate(self.candidate_mappings.items(), 1):
+            if i % 10 == 0:
+                print(f"  Validated {i}/{total}...")
+            messages = [
+                {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps({tag: candidates}) + f'\nSTART GENERATION WITH {{"{tag}": '},
+            ]
+            raw = self.client.chat(messages)
+            if not raw:
+                continue
+            try:
+                result = self._parse_llm_response(raw)
+                if result is None:
+                    logger.warning(f"Unparseable LLM response for '{tag}': {raw[:80]!r}")
+                    continue
+                # reject any word not in the candidates list
+                valid = [w for w in set(result) if w in candidate_set_cache[tag]]
+                if valid:
+                    expansions[tag] = valid
+                    self.stats.verified_expansions += len(valid)
+            except Exception as e:
+                logger.error(f"Validation error for '{tag}': {e}")
+
+        return expansions
+
+def apply_expansions(
+    metadata: List[Dict], expansions: Dict[str, List[str]]
+) -> List[Dict]:
+    """Return a copy of metadata entries with expanded keyword sets"""
+    result = []
+    for entry in metadata:
+        if "Composite:Keywords" in entry:
+            kw_key = "Composite:Keywords"
+        elif "Subject" in entry:
+            kw_key = "Subject"
+        else:
+            continue
+        current = entry[kw_key]
+        if isinstance(current, str):
+            current = [current]
+        expanded = set(current)
+        for kw in set(current):
+            if kw in expansions:
+                expanded.update(expansions[kw])
+        new_entry = entry.copy()
+        new_entry[kw_key] = list(expanded)
+        result.append(new_entry)
+    return result
+
+
+def load_json(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_json(data, path: str):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=str)
+    logger.info(f"Saved: {path}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Expand image metadata keywords using semantic similarity and LLM validation"
+    )
+    parser.add_argument("directory", help="Directory containing image files")
+    parser.add_argument(
+        "--api-base-url", default="http://localhost:8080",
+        help="Base URL for OpenAI-compatible API — do not include /v1 (default: %(default)s)",
+    )
+    parser.add_argument("--api-key", default="sk-no-key-required")
+    parser.add_argument("--embedding-model", default="all-MiniLM-L6-v2")
+    parser.add_argument("--chat-model", default="llama-3-8b-instruct")
+    parser.add_argument(
+        "--max-candidates", type=int, default=15,
+        help="Max similar keywords to consider per keyword (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--similarity-threshold", type=float, default=0.64,
+        help="FAISS L2 distance cutoff — lower is stricter (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--skip-embeds", action="store_true",
+        help="Skip embedding step and load existing candidates checkpoint from target directory",
+    )
+    parser.add_argument(
+        "--skip-candidates", action="store_true",
+        help="Skip LLM validation — stop after building the candidate map",
+    )
+    parser.add_argument(
+        "--load-json", default=None,
+        help="Load metadata from this JSON file instead of scanning the directory",
+    )
+    args = parser.parse_args()
+
+    config = Config.from_args(args)
+    target_dir = Path(config.directory)
+
+    if not target_dir.exists():
+        print(f"Directory not found: {target_dir}")
+        sys.exit(1)
+
+    metadata_file   = target_dir / "KeywordExpander_metadata.json"
+    embeddings_file = target_dir / "KeywordExpander_embeddings.npz"
+    candidates_file = target_dir / "KeywordExpander_candidates.json"
+    expansions_file = target_dir / "KeywordExpander_expansions.json"
+
+    if config.load_json:
+        print(f"Loading metadata from {config.load_json}")
+        metadata = load_json(config.load_json)
+    elif metadata_file.exists():
+        print(f"Loading cached metadata from {metadata_file}")
+        metadata = load_json(str(metadata_file))
+    else:
+        print(f"Extracting metadata from {target_dir}...")
+        try:
+            with exiftool.ExifToolHelper() as et:
+                metadata = et.get_tags(str(target_dir), ["MWG:Keywords", "Subject"], "-r")
+        except Exception as e:
+            print(f"ExifTool error: {e}")
+            sys.exit(1)
+        if not metadata:
+            print("No metadata found.")
+            sys.exit(0)
+        save_json(metadata, str(metadata_file))
+        print(f"Metadata saved to {metadata_file}")
+
+    processor = KeywordProcessor(config)
+    processor.prepare(metadata)
+
+    if config.skip_embeds:
+        if candidates_file.exists():
+            print(f"Loading cached candidates from {candidates_file}")
+            processor.candidate_mappings = load_json(str(candidates_file))
+        else:
+            print("--skip-embeds set but no candidates checkpoint found. Run without --skip-embeds first.")
+            sys.exit(1)
+    else:
+        processor.embed(embeddings_file)
+        if processor.candidate_mappings:
+            save_json(processor.candidate_mappings, str(candidates_file))
+            print(f"Candidates checkpoint saved to {candidates_file}")
+
+    print(processor.stats)
+
+    if config.skip_candidates:
+        print("--skip-candidates set; stopping after candidate map.")
+        return
+
+    if not processor.candidate_mappings:
+        print("No candidates found. Try lowering --similarity-threshold.")
+        return
+
+    expansions = processor.validate()
+    print(processor.stats)
+
+    if not expansions:
+        print("No expansions found.")
+        return
+
+    save_json(expansions, str(expansions_file))
+    print(f"Expansions saved to {expansions_file}")
+
+    expanded_metadata = apply_expansions(metadata, expansions)
+    if not expanded_metadata:
+        print("No entries to update.")
+        return
+
+    print(f"Writing expanded keywords to {len(expanded_metadata)} files...")
+    success = fail = 0
+    with exiftool.ExifToolHelper() as et:
+        for entry in expanded_metadata:
+            src = entry.get("SourceFile")
+            if not src:
+                continue
+            file_path = Path(src)  # ExifTool returns absolute paths
+            if not file_path.exists():
+                logger.warning(f"File not found: {file_path}")
+                fail += 1
+                continue
+            if not os.access(file_path, os.W_OK):
+                logger.warning(f"No write permission: {file_path}")
+                fail += 1
+                continue
+            kw_key = "Composite:Keywords" if "Composite:Keywords" in entry else "Subject"
+            try:
+                et.set_tags(
+                    str(file_path),
+                    tags={"MWG:Keywords": entry[kw_key]},
+                    params=["-P", "-overwrite_original"],
+                )
+                success += 1
+            except Exception as e:
+                logger.error(f"Failed writing {file_path}: {e}")
+                fail += 1
+
+    print(f"Complete: {success} succeeded, {fail} failed.")
+
+
+if __name__ == "__main__":
     main()
-    
